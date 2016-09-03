@@ -12,6 +12,7 @@
 </head>
 <body>
     {% block body %}
+        {% block header %} <div><a href="{{ url_for('index') }}">Index</a></div> {% endblock %}
         {% block content %}{% endblock %}
     {% endblock %}
 </body>
