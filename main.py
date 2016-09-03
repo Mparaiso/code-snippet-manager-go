@@ -38,6 +38,15 @@ def user(name):
     """example of route with variable rendered in a template """
     return flask.render_template("user.j2.html",name=name)
 
+@app.errorhandler(404)
+def page_not_found(e):
+    """ example of custom error handling page """
+    return flask.render_template("404.j2.html"),404
+
+@app.errorhandler(500)
+def internal_server_error(e):
+    return flask.render_template("500.j2.html"),500
+
 # entry point
 if __name__ == '__main__':
     app.run(debug=True)
