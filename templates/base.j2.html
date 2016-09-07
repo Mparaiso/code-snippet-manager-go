@@ -1,19 +1,32 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     {% block head %}
         <meta charset="UTF-8">
         <title>{% block title %}SnipThis{% endblock %}</title>
-        {% block headscripts %}{% endblock %}
+        {% block headscripts %}{% endblock %} 
         {% block headstyles %}
-            <link rel="stylesheet" href="{{ url_for('static',filename='css/styles.css') }}">
-        {% endblock %}
+        <link rel="stylesheet" href="{{ url_for('static',filename='css/styles.css') }}"> 
+        {% endblock %} 
     {% endblock %}
 </head>
+
 <body>
-    {% block body %}
-        {% block header %} <div><a href="{{ url_for('index') }}">Index</a></div> {% endblock %}
+    {% block body %} 
+        {% block header %}
+        <div><a href="{{ url_for('index') }}">Index</a></div> 
+        {% endblock %}
+        {% block flash %} 
+            {% for message in get_flashed_messages()
+            %}
+            <div class="alert alert-warning">
+                {{message}}
+            </div>
+            {% endfor %} 
+        {% endblock%} 
         {% block content %}{% endblock %}
     {% endblock %}
 </body>
+
 </html>

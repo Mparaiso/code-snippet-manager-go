@@ -59,6 +59,9 @@ def nameform():
     form = NameForm(flask.request.form)
     
     if form.validate_on_submit():
+        old_name = flask.session.get('name')
+        if old_name is not None and old_name!=form.name.data:
+            flask.flash("looks like you have changed your name!")
         flask.session['name'] = form.name.data
         return flask.redirect(flask.url_for('nameform'))
         
