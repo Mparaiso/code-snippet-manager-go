@@ -1,0 +1,17 @@
+{% extends 'base.j2.html' %}
+{% from "_formhelpers.j2.html" import render_field %}
+{% block title %}Form Example{%endblock%}
+{% block content %}
+{% if name %}
+    <div>Hello {{ name }}!</div>
+{% endif %}
+<div>
+    <form  method="post" action="{{url_for('nameform')}}">
+        <dl>
+            {{ form.csrf_token }}
+            {{ render_field(form.name) }}
+            {{ render_field(form.submit) }}
+        </dl>
+    </form>
+</div>
+{% endblock %}

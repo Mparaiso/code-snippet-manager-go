@@ -8,14 +8,29 @@
 # are centralized on one server and easy to create,update,manage and query
 
 import flask
+from flask_moment import Moment
+from flask.ext.wtf import Form
+from wtforms import StringField,SubmitField
+from wtforms.validators import Required
+from datetime import datetime
 
 app = flask.Flask(__name__)
+app.config['SECRET_KEY'] = "some secret key to change later"
+moment = Moment(app)
 
+
+# forms
+class NameForm(Form):
+    name = StringField("What is your name?",validators=[Required()])
+    submit = SubmitField("Submit")
+
+# route map
 @app.route('/')
 def index():
     """ exemple of use of request object """
     user_agent = flask.request.headers.get('User-Agent')
-    return "Hello Code Snippet Manager \n your user agent is %s " % user_agent
+    return flask.render_template('index.j2.html',
+        current_time=datetime.utcnow(),user_agent=user_agent)
 
 @app.route("/badrequest")
 def badrequest():
@@ -38,6 +53,18 @@ def user(name):
     """example of route with variable rendered in a template """
     return flask.render_template("user.j2.html",name=name)
 
+@app.route("/nameform",methods=['GET','POST'])
+def nameform():
+    """Rendering an html form """
+    form = NameForm(flask.request.form)
+    
+    if form.validate_on_submit():
+        flask.session['name'] = form.name.data
+        return flask.redirect(flask.url_for('nameform'))
+        
+    return flask.render_template("nameform.j2.html",
+        form=form,name=flask.session.get('name'))
+
 @app.errorhandler(404)
 def page_not_found(e):
     """ example of custom error handling page """
@@ -46,6 +73,7 @@ def page_not_found(e):
 @app.errorhandler(500)
 def internal_server_error(e):
     return flask.render_template("500.j2.html"),500
+
 
 # entry point
 if __name__ == '__main__':
