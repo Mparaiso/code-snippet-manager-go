@@ -3,12 +3,22 @@ version: 1
 runtime: go
 api_version: go1
 
+# ...
+# inbound_services:
+# - warmup
+# do stuff before the actual request
+# @see https://cloud.google.com/appengine/docs/go/warmup-requests/configuring
+
 handlers:
-- url: stylesheets
+- url: /stylesheets
   static_dir: static/stylesheets
 
 - url: /javascript
   static_dir: static/javascript
+
+# - url: /_ah/warmup
+#  script: _go_app
+#  login: admin
 
 - url: /.*
   script: _go_app  
