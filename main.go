@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
-	"regexp"
 	"time"
 
 	"golang.org/x/net/context"
@@ -15,314 +14,204 @@ import (
 	"google.golang.org/appengine/datastore"
 	"google.golang.org/appengine/log"
 
+	matcher "github.com/Mparaiso/request-matcher-go"
 	m "github.com/Mparaiso/simple-middleware-go"
-	matcher "github.com/Mparaiso/simple-router-go"
 )
 
-// An Entity is a datastore entity
-//
-// GetID returns the ID
-//
-// SetID sets the ID
-type Entity interface {
-	GetID() int64
-	SetID(int64)
-}
-
-// Signal is an implementation of the signal pattern
-type Signal interface {
-	Add(Listener)
-	Remove(Listener)
-	Dispatch(data interface{}) error
-}
-
-// Listener handle signals
-type Listener interface {
-	Handle(data interface{}) error
-}
-
-type kind struct{ Users, Migrations, Snippets string }
-
 // Kind list app kinds
-var Kind = kind{"Users", "Migrations", "Snippets"}
+var Kind = struct{ Users, Migrations, Snippets, Categories string }{"Users", "Migrations", "Snippets", "Categories"}
 
 func init() {
-	app := new(App)
-	http.Handle("/", app)
+	http.Handle("/", NewApp().Compile())
 }
 
-var _ matcher.MatcherProvider = new(Route)
+var (
+	_ matcher.MatcherProvider = new(Route)
+	_ EndPointContainer       = new(DefaultEndPointContainer)
+)
 
-// Route is an app route
-type Route struct {
-	Handler  m.Handler
-	Matchers []matcher.Matcher
+type UserEndPointContainerFactory struct {
 }
 
-// GetMatchers return the request matchers
-func (route *Route) GetMatchers() matcher.Matchers {
-	return route.Matchers
-}
-
-func (route Route) String() string {
-	representation := "("
-	for _, matcher := range route.Matchers {
-		representation += fmt.Sprint(matcher, ",")
+func (UserEndPointContainerFactory) Create(container m.Container) EndPointContainer {
+	return &DefaultEndPointContainer{
+		ContextAwareContainer: container.(*Container),
+		kind:      Kind.Users,
+		prototype: reflect.TypeOf(User{}),
 	}
-	return representation[:len(representation)-1] + ")"
+}
+
+type SnippetEndPointContainerFactory struct{}
+
+func (SnippetEndPointContainerFactory) Create(container m.Container) EndPointContainer {
+	return &DefaultEndPointContainer{
+		ContextAwareContainer: container.(*Container),
+		kind:      Kind.Snippets,
+		prototype: reflect.TypeOf(Snippet{}),
+	}
+}
+
+type CategoryEndPointContainerFactory struct{}
+
+func (CategoryEndPointContainerFactory) Create(container m.Container) EndPointContainer {
+	return &DefaultEndPointContainer{
+		ContextAwareContainer: container.(*Container),
+		kind:      Kind.Categories,
+		prototype: reflect.TypeOf(Category{}),
+	}
+}
+
+type ContextAwareContainer interface {
+	m.Container
+	ContextProvider
+}
+
+type DefaultEndPointContainer struct {
+	kind      string
+	prototype reflect.Type
+	ContextAwareContainer
+	repository Repository
+}
+
+func NewDefaultEndPointContainer(kind string,
+	prototype reflect.Type,
+	container ContextAwareContainer,
+) *DefaultEndPointContainer {
+	return &DefaultEndPointContainer{kind: kind, prototype: prototype, ContextAwareContainer: container}
+}
+
+func (endpointContainer *DefaultEndPointContainer) GetRepository() Repository {
+	if endpointContainer.repository == nil {
+		endpointContainer.repository = NewAppengineRepositoryProvider(endpointContainer, endpointContainer.kind)
+	}
+	return endpointContainer.repository
+}
+
+func (endpointContainer DefaultEndPointContainer) GetPrototype() reflect.Type {
+	return endpointContainer.prototype
 }
 
 // App is the web application
 type App struct {
-	sync.Once
+	*sync.Once
+	Debug bool
+	*Router
 }
 
-func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	container := NewContainer(w, r)
-	a.Do(func() {
-		ctx := container.GetContext()
-		if err := ExecuteMigrations(ctx, GetMigrations()); err != nil {
-			log.Errorf(ctx, "Error during migration '%s'.", err.Error())
-		} else {
-			log.Infof(ctx, "Migrations done")
+func (a App) GetContainer(w http.ResponseWriter, r *http.Request) m.Container {
+	return NewContainer(w, r)
+}
+
+func NewApp() *App {
+	app := new(App)
+	app.Debug = true
+	app.Router = NewRouter()
+	app.Once = new(sync.Once)
+
+	app.ContainerFactory = app
+
+	snippetEndpoint := NewEndpoint(new(SnippetEndPointContainerFactory))
+	categoryEndpoint := NewEndpoint(new(CategoryEndPointContainerFactory))
+	userEndpoint := NewEndpoint(new(UserEndPointContainerFactory))
+
+	app.Use(func(next m.Handler) m.Handler {
+		return func(c m.Container) {
+			container := c.(*Container)
+			container.SetContainerOptions(ContainerOptions{Debug: app.Debug})
+			app.Do(func() {
+				ctx := container.GetContext()
+				if err := ExecuteMigrations(ctx, GetMigrations()); err != nil {
+					log.Errorf(ctx, "Error during migration '%s'.", err.Error())
+				} else {
+					log.Infof(ctx, "Migrations done")
+				}
+			})
+			next(c)
 		}
-	})
-	snippetEndpoint := &EndPoint{EntityType: reflect.TypeOf(&Snippet{}), Kind: Kind.Snippets}
-	requestMatcher := matcher.NewRequestMatcher(matcher.MatcherProviders{
-		&Route{warmup, matcher.Matchers{matcher.NewURLMatcher("/_ah/warmup")}},
-		&Route{snippetEndpoint.Index,
-			matcher.Matchers{matcher.NewMethodMatcher("GET"),
-				matcher.NewRegexMatcher(regexp.MustCompile(`^/snippets/?$`))}},
-		&Route{snippetEndpoint.Post,
-			matcher.Matchers{matcher.NewMethodMatcher("POST"),
-				matcher.NewRegexMatcher(regexp.MustCompile(`^/snippets/?$`))}},
-		&Route{snippetEndpoint.Get,
-			matcher.Matchers{matcher.NewMethodMatcher("GET"),
-				matcher.NewRegexMatcher(regexp.MustCompile(`^/snippets/(?P<id>\d+)/?$`))}},
-		&Route{index, matcher.Matchers{matcher.NewMethodMatcher("GET"), matcher.NewURLMatcher("/")}},
-		&Route{name, matcher.Matchers{matcher.NewRegexMatcher(regexp.MustCompile(`^/(?P<name>[\w \s]+)/?$`))}},
-	})
-
-	if matcher := requestMatcher.Match(r); matcher != nil {
-		matcher.(*Route).Handler(container)
-	} else {
-		http.NotFound(w, r)
-	}
+	}).
+		Get("/", index).
+		Mount("/snippets", snippetEndpoint).
+		Mount("/categories", categoryEndpoint).
+		Mount("/users", userEndpoint)
+	return app
 }
 
-func onStart(c m.Container) {
-	ctx := appengine.NewContext(c.Request())
-	log.Infof(ctx, "=> start up")
+type AppengineRepositoryProvider struct {
+	Kind string
+	ContextProvider
+	Repository
+	listeners []Listener
+}
+
+func NewAppengineRepositoryProvider(contextProvider ContextProvider, kind string, listeners ...Listener) *AppengineRepositoryProvider {
+	return &AppengineRepositoryProvider{Kind: kind, ContextProvider: contextProvider, listeners: listeners}
+}
+
+func (provider *AppengineRepositoryProvider) GetRepository() (Repository, error) {
+	if provider.Repository == nil {
+		provider.Repository = NewDefaultRepository(provider.GetContext(), provider.Kind, provider.listeners...)
+	}
+	return provider.Repository, nil
 }
 
 func index(c m.Container) {
-	fmt.Fprint(c.ResponseWriter(), "Hello Smart Snippets")
+	fmt.Fprint(c.GetResponseWriter(), "Hello Smart Snippets")
 }
 
-func name(c m.Container) {
-	name := c.Request().URL.Query().Get("@name")
-	fmt.Fprintf(c.ResponseWriter(), "Hello %s", name)
-}
-
-func warmup(c m.Container) {
-	ctx := appengine.NewContext(c.Request())
-	log.Infof(ctx, "=> warmup done")
-}
-
-// ContextProvider provides a context
-type ContextProvider interface {
-	GetContext() context.Context
+type ContainerOptions struct {
+	Debug bool
 }
 
 // Container is a container
 type Container struct {
 	m.Container
+	ContextFactory ContextFactory
 	context.Context
+	containerOptions ContainerOptions
+	logger           m.Logger
+}
+
+func (c Container) IsDebug() bool {
+	return c.containerOptions.Debug
 }
 
 // NewContainer creates a new container
 func NewContainer(w http.ResponseWriter, r *http.Request) *Container {
-	return &Container{Container: m.DefaultContainer{Req: r, RW: w}}
+	return &Container{Container: m.DefaultContainer{Request: r, ResponseWriter: w}}
+}
+func (c *Container) SetContainerOptions(options ContainerOptions) {
+	c.containerOptions = options
+}
+func (c *Container) Error(err error, statusCode int) {
+	if c.IsDebug() {
+		c.Container.Error(err, statusCode)
+	} else {
+		c.Container.Error(m.StatusError(statusCode), statusCode)
+		c.MustGetLogger().Log(m.Error, err)
+	}
+}
+func (c *Container) GetLogger() (m.Logger, error) {
+	if c.logger == nil {
+		c.logger = NewAppEngineLogger(c.GetContext())
+	}
+	return c.logger, nil
+}
+func (c *Container) MustGetLogger() m.Logger {
+	l, _ := c.GetLogger()
+	return l
 }
 
 // GetContext returns a context
+// optionally build the context from the ContextFactory if not nil
 func (c *Container) GetContext() context.Context {
 	if c.Context == nil {
-		c.Context = appengine.NewContext(c.Request())
+		if c.ContextFactory != nil {
+			c.Context = c.ContextFactory.Create(c.GetRequest())
+		} else {
+			c.Context = appengine.NewContext(c.GetRequest())
+		}
 	}
 	return c.Context
-}
-
-// Migration is a DB migration
-type Migration struct {
-	ID      int64
-	Name    string
-	Created time.Time
-	Updated time.Time
-	Task    func(ctx context.Context) error `datastore:"-"`
-}
-
-func (m Migration) GetID() int64               { return m.ID }
-func (m *Migration) SetID(id int64)            { m.ID = id }
-func (m *Migration) SetCreated(date time.Time) { m.Created = date }
-func (m *Migration) SetUpdated(date time.Time) { m.Updated = date }
-
-// User is an app user
-type User struct {
-	ID       int64
-	Nickname string
-	Created  time.Time
-	Updated  time.Time
-	Version  int64
-}
-
-func (u User) GetID() int64               { return u.ID }
-func (u *User) SetID(id int64)            { u.ID = id }
-func (u User) GetVersion() int64          { return u.Version }
-func (u *User) SetVersion(version int64)  { u.Version = version }
-func (u *User) SetCreated(date time.Time) { u.Created = date }
-func (u *User) SetUpdated(date time.Time) { u.Updated = date }
-
-type CreatedUpdatedSetter interface {
-	SetCreated(date time.Time)
-	SetUpdated(date time.Time)
-}
-type VersionGetterSetter interface {
-	SetVersion(int64)
-	GetVersion() int64
-}
-
-type UserRepository struct {
-	Repository
-}
-
-func NewUserRepository(ctx context.Context) *UserRepository {
-	return &UserRepository{NewDefaultRepository(ctx, Kind.Users)}
-}
-
-type MigrationRepository struct {
-	Repository
-}
-
-func NewMigrationRepository(ctx context.Context) *MigrationRepository {
-	return &MigrationRepository{NewDefaultRepository(ctx, Kind.Migrations)}
-}
-
-type BeforeCreateListener interface {
-	BeforeCreate(ctx context.Context) error
-}
-
-type BeforeUpdateListener interface {
-	BeforeUpdate(ctx context.Context) error
-}
-
-// Repository is a entity repository
-type Repository interface {
-	Create(entity Entity) error
-	Update(entity Entity) error
-	Delete(entity Entity) error
-	FindByID(id int64, entity Entity) error
-	FindAll(entities interface{}) error
-}
-
-// DefaultRepository is the default implementation of Repository
-type DefaultRepository struct {
-	Context            context.Context
-	Kind               string
-	BeforeCreateSignal Signal
-	BeforeUpdateSignal Signal
-	BeforeDeleteSignal Signal
-}
-
-func NewDefaultRepository(ctx context.Context, kind string) *DefaultRepository {
-	defaultRepository := &DefaultRepository{Context: ctx, Kind: kind}
-	defaultRepository.BeforeCreateSignal = NewDefaultSignal()
-	defaultRepository.BeforeCreateSignal.Add(ListenerFunc(BeforeCreateListenerFunc))
-	defaultRepository.BeforeUpdateSignal = NewDefaultSignal()
-	defaultRepository.BeforeUpdateSignal.Add(ListenerFunc(BeforeUpdateListenerFunc))
-	return defaultRepository
-}
-
-// Create an entity
-func (repository DefaultRepository) Create(entity Entity) error {
-	low, _, err := datastore.AllocateIDs(repository.Context, repository.Kind, nil, 1)
-	entity.SetID(low)
-
-	if err == nil {
-		if repository.BeforeCreateSignal != nil {
-			err = repository.BeforeCreateSignal.Dispatch(entity)
-			if err != nil {
-				return err
-			}
-		}
-		key := datastore.NewKey(repository.Context, repository.Kind, "", entity.GetID(), nil)
-		_, err = datastore.Put(repository.Context, key, entity)
-	}
-	return err
-}
-
-// Update an entity
-func (repository DefaultRepository) Update(entity Entity) error {
-	key := datastore.NewKey(repository.Context, repository.Kind, "", entity.GetID(), nil)
-	if repository.BeforeUpdateSignal != nil {
-		err := repository.BeforeUpdateSignal.Dispatch(entity)
-		if err != nil {
-			return err
-		}
-	}
-	_, err := datastore.Put(repository.Context, key, entity)
-	return err
-}
-
-// Delete an entity
-func (repository DefaultRepository) Delete(entity Entity) error {
-	key := datastore.NewKey(repository.Context, repository.Kind, "", entity.GetID(), nil)
-	if repository.BeforeDeleteSignal != nil {
-		err := repository.BeforeDeleteSignal.Dispatch(entity)
-		if err != nil {
-			return err
-		}
-	}
-	return datastore.Delete(repository.Context, key)
-}
-
-// FindByID gets an entity by id
-func (repository DefaultRepository) FindByID(id int64, entity Entity) error {
-	key := datastore.NewKey(repository.Context, repository.Kind, "", id, nil)
-	return datastore.Get(repository.Context, key, entity)
-}
-
-func (repository DefaultRepository) FindAll(entities interface{}) error {
-	_, err := datastore.NewQuery(repository.Kind).GetAll(repository.Context, entities)
-	return err
-}
-
-// Snippet is a code snippet
-type Snippet struct {
-	ID          int64
-	Title       string
-	Description string
-	Content     string
-	CategoryID  int64
-	Category    *Category `datastore:"-"`
-	Author      *User     `datastore:"-"`
-	Created     time.Time
-	Updated     time.Time
-	Version     int64
-}
-
-func (s Snippet) GetID() int64               { return s.ID }
-func (s *Snippet) SetID(id int64)            { s.ID = id }
-func (s Snippet) GetVersion() int64          { return s.Version }
-func (s *Snippet) SetVersion(version int64)  { s.Version = version }
-func (s *Snippet) SetCreated(date time.Time) { s.Created = date }
-func (s *Snippet) SetUpdated(date time.Time) { s.Updated = date }
-
-// Category is a snippet category
-type Category struct {
-	ID          int64
-	Title       string
-	Description string
 }
 
 func MustParse(layout string, value string) time.Time {
@@ -332,6 +221,8 @@ func MustParse(layout string, value string) time.Time {
 	}
 	return t
 }
+
+const Rfc2822 = "Mon, 02 Jan 2006 15:04:05 -0700"
 
 // GetMigrations get al list of migrations
 func GetMigrations() []*Migration {
@@ -345,7 +236,38 @@ func GetMigrations() []*Migration {
 				err = NewUserRepository(ctx).Create(user)
 			}
 			return err
-		}},
+		}}, {
+			Name: "002-categories", Created: MustParse(Rfc2822, "Fri, 21 Oct 2016 09:11:26 +0200"), Task: func(ctx context.Context) error {
+				categories := []*Category{
+					{Title: "PHP", Description: "The PHP Language"},
+					{Title: "Javascript", Description: "The Javascript Language"},
+					{Title: "Go", Description: "The Go Language"},
+					{Title: "Java", Description: "The Java Language"},
+					{Title: "Ruby", Description: "The Ruby Language"},
+					{Title: "Python", Description: "The Python Language"},
+					{Title: "C", Description: "The C Language"},
+					{Title: "C++", Description: "The C++ Language"},
+					{Title: "SQL", Description: "The SQL Query Language"},
+					{Title: "Scala", Description: "The Scala Language"},
+					{Title: "Rust", Description: "The Rust Language"},
+					{Title: "LISP", Description: "The LISP Language"},
+					{Title: "HTML", Description: "The HTML Markup Language"},
+					{Title: "XML", Description: "The XML Language"},
+					{Title: "CSS", Description: "The CSS Language"},
+					{Title: "Typescript", Description: "The Typescript Language"},
+					{Title: "Swift", Description: "The Swift Language"},
+					{Title: "Objective-C", Description: "The Objective-C Language"},
+				}
+				repository := NewCategoryRepository(ctx)
+				for _, category := range categories {
+					err := repository.Create(category)
+					if err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		},
 	}
 }
 
@@ -362,6 +284,7 @@ func ExecuteMigrations(ctx context.Context, migrations []*Migration) error {
 					_, err = datastore.Put(ctx, datastore.NewKey(ctx, Kind.Migrations, "", migration.ID, nil), migration)
 				}
 			}
+			return err
 		}
 		if err != nil {
 			return err
@@ -370,75 +293,47 @@ func ExecuteMigrations(ctx context.Context, migrations []*Migration) error {
 	return nil
 }
 
-type ListenerFunc func(data interface{}) error
-
-func (l ListenerFunc) Handle(data interface{}) error {
-	return l(data)
+type BeforeEntityCreateEvent struct {
+	Entity
 }
 
-type DefaultSignal struct {
-	Listeners []Listener
-}
-
-func NewDefaultSignal() *DefaultSignal {
-	return &DefaultSignal{Listeners: []Listener{}}
-}
-
-func (signal *DefaultSignal) Add(l Listener) {
-	if signal.IndexOf(l) != -1 {
-		return
-	}
-	signal.Listeners = append(signal.Listeners, l)
-}
-
-func (signal *DefaultSignal) IndexOf(l Listener) int {
-	for i, listener := range signal.Listeners {
-		if listener == l {
-			return i
+func BeforeEntityCreateListener(e Event) error {
+	switch event := e.(type) {
+	case BeforeEntityCreateEvent:
+		if e, ok := event.Entity.(CreatedUpdatedSetter); ok {
+			e.SetCreated(time.Now())
+			e.SetUpdated(time.Now())
 		}
-	}
-	return -1
-}
-
-func (signal *DefaultSignal) Remove(l Listener) {
-	index := signal.IndexOf(l)
-	if index == -1 {
-		return
-	}
-	head := signal.Listeners[:index]
-	if index == len(signal.Listeners)-1 {
-		signal.Listeners = head
-	} else {
-		signal.Listeners = append(head, signal.Listeners[index+1:]...)
-	}
-}
-
-func (signal *DefaultSignal) Dispatch(data interface{}) error {
-	for _, listener := range signal.Listeners {
-		if err := listener.Handle(data); err != nil {
-			return err
+		if e, ok := event.Entity.(VersionGetterSetter); ok {
+			e.SetVersion(1)
 		}
 	}
 	return nil
 }
 
-func BeforeCreateListenerFunc(entity interface{}) error {
-	if e, ok := entity.(CreatedUpdatedSetter); ok {
-		e.SetCreated(time.Now())
-		e.SetUpdated(time.Now())
-	}
-	if e, ok := entity.(VersionGetterSetter); ok {
-		e.SetVersion(1)
+type BeforeEntityUpdateEvent struct {
+	Old Entity
+	New Entity
+}
+
+func BeforeEntityUpdateListener(e Event) error {
+	switch event := e.(type) {
+	case BeforeEntityUpdateEvent:
+		if entity, ok := event.Old.(VersionGetterSetter); ok {
+			if old, new := entity, event.New.(VersionGetterSetter); old.GetVersion() != new.GetVersion() {
+				return fmt.Errorf("Versions do not match old : %d , new : %d", old.GetVersion(), new.GetVersion())
+			} else {
+				new.SetVersion(old.GetVersion() + 1)
+			}
+		}
+		if entity, ok := event.New.(CreatedUpdatedSetter); ok {
+			entity.SetUpdated(time.Now())
+		}
+		event.New.SetID(event.Old.GetID())
 	}
 	return nil
 }
 
-func BeforeUpdateListenerFunc(entity interface{}) error {
-	if e, ok := entity.(CreatedUpdatedSetter); ok {
-		e.SetUpdated(time.Now())
-	}
-	if e, ok := entity.(VersionGetterSetter); ok {
-		e.SetVersion(e.GetVersion() + 1)
-	}
-	return nil
+type BeforeEntityDeleteEvent struct {
+	Entity
 }

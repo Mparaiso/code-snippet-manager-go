@@ -6,106 +6,196 @@ import (
 	"net/http"
 	"path"
 	"reflect"
-	"strconv"
 
 	m "github.com/Mparaiso/simple-middleware-go"
-	"google.golang.org/appengine/log"
 )
+
+type RepositoryProvider interface {
+	GetRepository() (Repository, error)
+}
+
+type BeforeCreateEvent struct{}
+type AfterCreateEvent struct{}
+
+type BeforeUpdateEvent struct{}
+type AfterUpdateEvent struct{}
+
+type BeforeDeleteEvent struct{}
+type AfterDeleteEvent struct{}
+
+type EndPointContainer interface {
+	m.Container
+	GetRepository() Repository
+	GetPrototype() reflect.Type
+}
+
+type EndPointContainerFactory interface {
+	Create(m.Container) EndPointContainer
+}
 
 // EndPoint is a rest endpoint
 type EndPoint struct {
-	Kind       string
-	EntityType reflect.Type
+	Prototype                 interface{}
+	cached                    bool
+	protoType                 reflect.Type
+	RepositoryProviderFactory func(m.Container) RepositoryProvider
+	IndexHandler              func(m.Container)
+	Signal                    Signal
+	EndPointContainerFactory
+}
+
+func NewEndpoint(endpointContainerFactory EndPointContainerFactory) *EndPoint {
+	return &EndPoint{EndPointContainerFactory: endpointContainerFactory}
 }
 
 // Handle handles HTTP requests
-/*func (e EndPoint) Handle(container m.Container) {
-	requestMatcher := matcher.NewRequestMatcher(matcher.MatcherProviders{
-		&Route{e.Get, matcher.Matchers{matcher.NewRegexMatcher(regexp.MustCompile(`/(?P<id>\d+)/?$`)), matcher.NewMethodMatcher("GET")}},
-		&Route{e.Put, matcher.Matchers{matcher.NewRegexMatcher(regexp.MustCompile(`/(?P<id>\d+)/?$`)), matcher.NewMethodMatcher("PUT")}},
-		&Route{e.Delete, matcher.Matchers{matcher.NewRegexMatcher(regexp.MustCompile(`/(?P<id>\d+)/?$`)), matcher.NewMethodMatcher("DELETE")}},
-		&Route{e.Index, matcher.Matchers{matcher.NewRegexMatcher(regexp.MustCompile(`/$`)), matcher.NewMethodMatcher("GET")}},
-		&Route{e.Post, matcher.Matchers{matcher.NewRegexMatcher(regexp.MustCompile(`/$`)), matcher.NewMethodMatcher("POST")}},
-	})
-	if match := requestMatcher.Match(container.Request()); match != nil {
-		match.(*Route).Handler(container)
-	} else {
-		http.NotFound(container.ResponseWriter(), container.Request())
-	}
-}*/
+func (e EndPoint) Connect(routeCollection *RouteCollection) {
+	routeCollection.
+		Use(func(next m.Handler) m.Handler {
+			return func(c m.Container) {
+				c.(*Container).MustGetLogger().Log(Debug, "Setting endpoint container")
+				next(e.EndPointContainerFactory.Create(c))
+			}
+		}).
+		Get("/", e.Index).
+		Post("/", e.Post).
+		Put("/:id", e.Put).
+		Delete("/:id", e.Delete).
+		Get("/:id", e.Get)
+}
 
 // Index list resources
 func (e EndPoint) Index(c m.Container) {
-	container := c.(interface {
-		ContextProvider
-		m.Container
-	})
-	repository := NewDefaultRepository(container.GetContext(), e.Kind)
-	//entities := reflect.MakeSlice(reflect.SliceOf(e.EntityType), 0, 0).Interface()
-	entities := reflect.MakeSlice(reflect.SliceOf(reflect.TypeOf(&Snippet{})), 0, 0).Interface()
+	if e.IndexHandler != nil {
+		e.IndexHandler(c)
+	}
+	container := c.(EndPointContainer)
+	repository := container.GetRepository()
+	entities := reflect.New(reflect.SliceOf(container.GetPrototype())).Interface()
 	err := repository.FindAll(entities)
 	if err != nil {
-		http.Error(c.ResponseWriter(), http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		log.Errorf(container.GetContext(), "repository.FindAll %s", err)
+		container.Error(err, http.StatusInternalServerError)
 		return
 	}
-	encoder := json.NewEncoder(c.ResponseWriter())
-	encoder.Encode(entities)
-
+	json.NewEncoder(container.GetResponseWriter()).Encode(entities)
 }
 
 // Get fetches a resource
 func (e EndPoint) Get(c m.Container) {
-	container := c.(interface {
-		ContextProvider
-		m.Container
-	})
-	id := container.Request().URL.Query().Get("@id")
-	ID, err := strconv.ParseInt(id, 10, 64)
+	container := c.(EndPointContainer)
+	var id int64
+	_, err := fmt.Sscanf(container.GetRequest().URL.Query().Get(":id"), "%d", &id)
 	if err != nil {
-		log.Errorf(container.GetContext(), "Error converting ID %s", err)
-		http.Error(container.ResponseWriter(), err.Error(), http.StatusInternalServerError)
+		container.Error(err, http.StatusBadRequest)
 		return
 	}
-	entity := reflect.New(e.EntityType.Elem()).Interface()
-	err = NewDefaultRepository(container.GetContext(), e.Kind).FindByID(ID, entity.(Entity))
+	entity := reflect.New(container.GetPrototype()).Interface()
+	repository := container.GetRepository()
+	err = repository.FindByID(id, entity.(Entity))
 	if err != nil {
-		log.Errorf(container.GetContext(), "Error finding entity with ID  %d", ID)
-		http.Error(container.ResponseWriter(), err.Error(), http.StatusInternalServerError)
+		container.Error(err, http.StatusInternalServerError)
 		return
 	}
-	json.NewEncoder(container.ResponseWriter()).Encode(entity)
+	json.NewEncoder(container.GetResponseWriter()).Encode(entity)
 }
 
 // Put updates a resource
-func (EndPoint) Put(container m.Container) {}
+func (e EndPoint) Put(c m.Container) {
+	container := c.(EndPointContainer)
+	entity := reflect.New(container.GetPrototype()).Interface()
+	var id int64
+	_, err := fmt.Sscanf(container.GetRequest().URL.Query().Get(":id"), "%d", &id)
+	if err != nil {
+		container.Error(err, http.StatusBadRequest)
+		return
+	}
+	repository := container.GetRepository()
+	err = repository.FindByID(id, entity.(Entity))
+	if err != nil {
+		container.Error(err, http.StatusNotFound)
+		return
+	}
+	candidate := reflect.New(container.GetPrototype()).Interface()
+	json.NewDecoder(container.GetRequest().Body).Decode(candidate)
+	candidate.(Entity).SetID(id)
+	err = e.Signal.Dispatch(&BeforeEntityUpdateEvent{})
+	if err != nil {
+		container.Error(err, http.StatusInternalServerError)
+		return
+	}
+	err = repository.Update(candidate.(Entity))
+	if err != nil {
+		container.Error(err, http.StatusInternalServerError)
+		return
+	}
+
+	if err = e.Signal.Dispatch(&AfterUpdateEvent{}); err != nil {
+		container.Error(err, http.StatusInternalServerError)
+		return
+	}
+	container.GetResponseWriter().WriteHeader(http.StatusOK)
+}
 
 // Delete deletes a resource
-func (EndPoint) Delete(container m.Container) {}
+func (e EndPoint) Delete(c m.Container) {
+	container := c.(EndPointContainer)
+	entity := reflect.New(container.GetPrototype()).Interface()
+	var id int64
+	_, err := fmt.Sscanf(container.GetRequest().URL.Query().Get(":id"), "%d", &id)
+	if err != nil {
+		container.Error(err, http.StatusBadRequest)
+		return
+	}
+	repository, err := e.RepositoryProviderFactory(container).GetRepository()
+	if err != nil {
+		container.Error(err, http.StatusInternalServerError)
+		return
+	}
+	err = repository.FindByID(id, entity.(Entity))
+	if err != nil {
+		container.Error(err, http.StatusNotFound)
+		return
+	}
+	err = e.Signal.Dispatch(&BeforeDeleteEvent{})
+	if err != nil {
+		container.Error(err, http.StatusInternalServerError)
+		return
+	}
+	err = repository.Delete(entity.(Entity))
+	if err != nil {
+		container.Error(err, http.StatusInternalServerError)
+		return
+	}
+	err = e.Signal.Dispatch(&AfterDeleteEvent{})
+	if err != nil {
+		container.Error(err, http.StatusInternalServerError)
+		return
+	}
+	container.GetResponseWriter().WriteHeader(http.StatusOK)
+}
 
 // Post creates a resource
 func (e EndPoint) Post(c m.Container) {
-	container := c.(interface {
-		ContextProvider
-		m.Container
-	})
-	entity := reflect.New(e.EntityType.Elem()).Interface()
+	container := c.(EndPointContainer)
+	entity := reflect.New(container.GetPrototype()).Interface()
 
-	decoder := json.NewDecoder(container.Request().Body)
+	decoder := json.NewDecoder(container.GetRequest().Body)
 	err := decoder.Decode(entity)
 	if err != nil {
-		http.Error(container.ResponseWriter(), http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		log.Errorf(container.GetContext(), "%s", err)
+		container.Error(err, http.StatusBadRequest)
 		return
 	}
-	repository := NewDefaultRepository(container.GetContext(), e.Kind)
+	repository, err := e.RepositoryProviderFactory(container).GetRepository()
+	if err != nil {
+		container.Error(err, http.StatusInternalServerError)
+		return
+	}
 	err = repository.Create(entity.(Entity))
 	if err != nil {
-		http.Error(container.ResponseWriter(), http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		log.Errorf(container.GetContext(), "%s", err)
+		container.Error(err, http.StatusInternalServerError)
 		return
 	}
-	location := path.Join(container.Request().URL.Path, fmt.Sprintf("%d", entity.(Entity).GetID()))
-	container.Request().Method = "GET"
-	http.Redirect(container.ResponseWriter(), container.Request(), location, 303)
+	location := path.Join(container.GetRequest().URL.Path, fmt.Sprintf("%d", entity.(Entity).GetID()))
+	container.GetRequest().Method = "GET"
+	http.Redirect(container.GetResponseWriter(), container.GetRequest(), location, 303)
 }
