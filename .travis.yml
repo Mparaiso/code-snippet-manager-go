@@ -11,5 +11,5 @@ install:
 	
 script:
 	- go version
-	- got get 
+	- got get -u
 	- ~/sdk/go_appengine/goapp test -v ./...
