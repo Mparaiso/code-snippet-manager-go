@@ -10,7 +10,8 @@ type Migration struct {
 	Name    string
 	Created time.Time
 	Updated time.Time
-	Task    func(ctx context.Context) error `datastore:"-"`
+	Task    func(ctx context.Context) error `datastore:"-" json:"-"`
+	Version int64
 }
 
 func (m Migration) GetID() int64               { return m.ID }
@@ -30,12 +31,15 @@ type User struct {
 	Version            int64
 }
 
-func (u User) GetID() int64               { return u.ID }
-func (u *User) SetID(id int64)            { u.ID = id }
-func (u User) GetVersion() int64          { return u.Version }
-func (u *User) SetVersion(version int64)  { u.Version = version }
-func (u *User) SetCreated(date time.Time) { u.Created = date }
-func (u *User) SetUpdated(date time.Time) { u.Updated = date }
+func (u User) GetID() int64                          { return u.ID }
+func (u *User) SetID(id int64)                       { u.ID = id }
+func (u User) GetVersion() int64                     { return u.Version }
+func (u *User) SetVersion(version int64)             { u.Version = version }
+func (u *User) SetCreated(date time.Time)            { u.Created = date }
+func (u *User) SetUpdated(date time.Time)            { u.Updated = date }
+func (u User) GetPassword() string                   { return u.Password }
+func (u *User) SetPassword(password string)          { u.Password = password }
+func (u *User) SetEncryptedPassword(password string) { u.EncryptedPassworld = password }
 
 // Snippet is a code snippet
 type Snippet struct {
@@ -82,4 +86,54 @@ type Token struct {
 	Expiration time.Time
 	Revoked    bool
 	Created    time.Time
+}
+
+type Role struct {
+	ID          int64
+	Name        string
+	Description string
+	Version     int64
+	Created     time.Time
+	Updated     time.Time
+	Locked      bool
+}
+
+func (r Role) GetID() int64               { return r.ID }
+func (r *Role) SetID(id int64)            { r.ID = id }
+func (r *Role) SetCreated(date time.Time) { r.Created = date }
+func (r *Role) SetUpdated(date time.Time) { r.Updated = date }
+func (r Role) GetVersion() int64          { return r.Version }
+func (r *Role) SetVersion(version int64)  { r.Version = version }
+func (r *Role) IsLocked() bool            { return r.Locked }
+
+type Roles []*Role
+
+func (roles Roles) GetByName(roleName string) *Role {
+	for _, role := range roles {
+		if role.Name == roleName {
+			return role
+		}
+
+	}
+	return nil
+}
+
+type UserRole struct {
+	ID      int64
+	RoleID  int64
+	UserID  int64
+	Created time.Time
+	Updated time.Time
+	Version int64
+}
+
+func (userRole UserRole) GetID() int64               { return userRole.ID }
+func (userRole *UserRole) SetID(id int64)            { userRole.ID = id }
+func (userRole *UserRole) SetCreated(date time.Time) { userRole.Created = date }
+func (userRole *UserRole) SetUpdated(date time.Time) { userRole.Updated = date }
+func (userRole UserRole) GetVersion() int64          { return userRole.Version }
+func (userRole *UserRole) SetVersion(version int64)  { userRole.Version = version }
+
+type Ancestor struct {
+	ID string
 }

@@ -7,30 +7,12 @@ import (
 	"path"
 	"reflect"
 
-	m "github.com/Mparaiso/simple-middleware-go"
+	tiger "github.com/Mparaiso/tiger-go-framework"
+	"github.com/Mparaiso/tiger-go-framework/signal"
 )
 
-type RepositoryProvider interface {
-	GetRepository() (Repository, error)
-}
-
-type BeforeCreateEvent struct{}
-type AfterCreateEvent struct{}
-
-type BeforeUpdateEvent struct{}
-type AfterUpdateEvent struct{}
-
-type BeforeDeleteEvent struct{}
-type AfterDeleteEvent struct{}
-
-type EndPointContainer interface {
-	m.Container
-	GetRepository() Repository
-	GetPrototype() reflect.Type
-}
-
-type EndPointContainerFactory interface {
-	Create(m.Container) EndPointContainer
+type EndPointOptions struct {
+	Commands map[string]bool
 }
 
 // EndPoint is a rest endpoint
@@ -38,38 +20,58 @@ type EndPoint struct {
 	Prototype                 interface{}
 	cached                    bool
 	protoType                 reflect.Type
-	RepositoryProviderFactory func(m.Container) RepositoryProvider
-	IndexHandler              func(m.Container)
-	Signal                    Signal
+	RepositoryProviderFactory func(tiger.Container) RepositoryProvider
+	IndexHandler              func(tiger.Container)
+	Signal                    signal.Signal
 	EndPointContainerFactory
+	Options EndPointOptions
 }
 
-func NewEndpoint(endpointContainerFactory EndPointContainerFactory) *EndPoint {
-	return &EndPoint{EndPointContainerFactory: endpointContainerFactory}
+func NewEndpoint(endpointContainerFactory EndPointContainerFactory, endpointOptions ...EndPointOptions) *EndPoint {
+
+	endpoint := &EndPoint{EndPointContainerFactory: endpointContainerFactory}
+	if len(endpointOptions) > 0 {
+		endpoint.Options = endpointOptions[0]
+	}
+	return endpoint
 }
 
-// Handle handles HTTP requests
-func (e EndPoint) Connect(routeCollection *RouteCollection) {
+// Connect handles HTTP requests
+func (e EndPoint) Connect(routeCollection *tiger.RouteCollection) {
+
 	routeCollection.
-		Use(func(next m.Handler) m.Handler {
-			return func(c m.Container) {
-				c.(*Container).MustGetLogger().Log(Debug, "Setting endpoint container")
-				next(e.EndPointContainerFactory.Create(c))
-			}
-		}).
-		Get("/", e.Index).
-		Post("/", e.Post).
-		Put("/:id", e.Put).
-		Delete("/:id", e.Delete).
-		Get("/:id", e.Get)
+		Use(func(c tiger.Container, next tiger.Handler) {
+			next(e.EndPointContainerFactory.Create(c))
+		})
+	if len(e.Options.Commands) == 0 || e.Options.Commands["INDEX"] {
+		routeCollection.Get("/", e.Wrap(e.Index))
+	}
+	if len(e.Options.Commands) == 0 || e.Options.Commands["POST"] {
+		routeCollection.Post("/", e.Wrap(e.Post))
+	}
+	if len(e.Options.Commands) == 0 || e.Options.Commands["PUT"] {
+		routeCollection.Put("/:id", e.Wrap(e.Put))
+	}
+	if len(e.Options.Commands) == 0 || e.Options.Commands["DELETE"] {
+		routeCollection.Delete("/:id", e.Wrap(e.Delete))
+	}
+	if len(e.Options.Commands) == 0 || e.Options.Commands["GET"] {
+		routeCollection.Get("/:id", e.Wrap(e.Get))
+	}
+}
+
+func (EndPoint) Wrap(handler func(c EndPointContainer)) func(c tiger.Container) {
+	return func(c tiger.Container) {
+		handler(c.(EndPointContainer))
+	}
 }
 
 // Index list resources
-func (e EndPoint) Index(c m.Container) {
+func (e EndPoint) Index(container EndPointContainer) {
 	if e.IndexHandler != nil {
-		e.IndexHandler(c)
+		e.IndexHandler(container)
+		return
 	}
-	container := c.(EndPointContainer)
 	repository := container.GetRepository()
 	entities := reflect.New(reflect.SliceOf(container.GetPrototype())).Interface()
 	err := repository.FindAll(entities)
@@ -77,12 +79,15 @@ func (e EndPoint) Index(c m.Container) {
 		container.Error(err, http.StatusInternalServerError)
 		return
 	}
-	json.NewEncoder(container.GetResponseWriter()).Encode(entities)
+	err = json.NewEncoder(container.GetResponseWriter()).Encode(entities)
+	if err != nil {
+		container.Error(err, http.StatusInternalServerError)
+	}
 }
 
 // Get fetches a resource
-func (e EndPoint) Get(c m.Container) {
-	container := c.(EndPointContainer)
+func (e EndPoint) Get(container EndPointContainer) {
+
 	var id int64
 	_, err := fmt.Sscanf(container.GetRequest().URL.Query().Get(":id"), "%d", &id)
 	if err != nil {
@@ -96,12 +101,14 @@ func (e EndPoint) Get(c m.Container) {
 		container.Error(err, http.StatusInternalServerError)
 		return
 	}
-	json.NewEncoder(container.GetResponseWriter()).Encode(entity)
+	err = json.NewEncoder(container.GetResponseWriter()).Encode(entity)
+	if err != nil {
+		container.Error(err, http.StatusInternalServerError)
+	}
 }
 
 // Put updates a resource
-func (e EndPoint) Put(c m.Container) {
-	container := c.(EndPointContainer)
+func (e EndPoint) Put(container EndPointContainer) {
 	entity := reflect.New(container.GetPrototype()).Interface()
 	var id int64
 	_, err := fmt.Sscanf(container.GetRequest().URL.Query().Get(":id"), "%d", &id)
@@ -118,7 +125,7 @@ func (e EndPoint) Put(c m.Container) {
 	candidate := reflect.New(container.GetPrototype()).Interface()
 	json.NewDecoder(container.GetRequest().Body).Decode(candidate)
 	candidate.(Entity).SetID(id)
-	err = e.Signal.Dispatch(&BeforeEntityUpdateEvent{})
+	err = container.GetSignal().Dispatch(&BeforeEntityUpdatedEvent{})
 	if err != nil {
 		container.Error(err, http.StatusInternalServerError)
 		return
@@ -129,7 +136,7 @@ func (e EndPoint) Put(c m.Container) {
 		return
 	}
 
-	if err = e.Signal.Dispatch(&AfterUpdateEvent{}); err != nil {
+	if err = container.GetSignal().Dispatch(&AfterResourceUpdateEvent{}); err != nil {
 		container.Error(err, http.StatusInternalServerError)
 		return
 	}
@@ -137,8 +144,8 @@ func (e EndPoint) Put(c m.Container) {
 }
 
 // Delete deletes a resource
-func (e EndPoint) Delete(c m.Container) {
-	container := c.(EndPointContainer)
+func (e EndPoint) Delete(container EndPointContainer) {
+
 	entity := reflect.New(container.GetPrototype()).Interface()
 	var id int64
 	_, err := fmt.Sscanf(container.GetRequest().URL.Query().Get(":id"), "%d", &id)
@@ -146,17 +153,14 @@ func (e EndPoint) Delete(c m.Container) {
 		container.Error(err, http.StatusBadRequest)
 		return
 	}
-	repository, err := e.RepositoryProviderFactory(container).GetRepository()
-	if err != nil {
-		container.Error(err, http.StatusInternalServerError)
-		return
-	}
+	repository := container.GetRepository()
+
 	err = repository.FindByID(id, entity.(Entity))
 	if err != nil {
 		container.Error(err, http.StatusNotFound)
 		return
 	}
-	err = e.Signal.Dispatch(&BeforeDeleteEvent{})
+	err = container.GetSignal().Dispatch(&BeforeResourceDeleteEvent{})
 	if err != nil {
 		container.Error(err, http.StatusInternalServerError)
 		return
@@ -166,7 +170,7 @@ func (e EndPoint) Delete(c m.Container) {
 		container.Error(err, http.StatusInternalServerError)
 		return
 	}
-	err = e.Signal.Dispatch(&AfterDeleteEvent{})
+	err = container.GetSignal().Dispatch(&AfterResourceDeleteEvent{})
 	if err != nil {
 		container.Error(err, http.StatusInternalServerError)
 		return
@@ -175,8 +179,7 @@ func (e EndPoint) Delete(c m.Container) {
 }
 
 // Post creates a resource
-func (e EndPoint) Post(c m.Container) {
-	container := c.(EndPointContainer)
+func (e EndPoint) Post(container EndPointContainer) {
 	entity := reflect.New(container.GetPrototype()).Interface()
 
 	decoder := json.NewDecoder(container.GetRequest().Body)
@@ -185,11 +188,8 @@ func (e EndPoint) Post(c m.Container) {
 		container.Error(err, http.StatusBadRequest)
 		return
 	}
-	repository, err := e.RepositoryProviderFactory(container).GetRepository()
-	if err != nil {
-		container.Error(err, http.StatusInternalServerError)
-		return
-	}
+	repository := container.GetRepository()
+
 	err = repository.Create(entity.(Entity))
 	if err != nil {
 		container.Error(err, http.StatusInternalServerError)

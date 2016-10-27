@@ -2,10 +2,12 @@ package smartsnippets
 
 import (
 	"net/http"
+	"reflect"
 	"time"
 
-	"github.com/Mparaiso/simple-validation-go"
-
+	tiger "github.com/Mparaiso/tiger-go-framework"
+	"github.com/Mparaiso/tiger-go-framework/signal"
+	"github.com/Mparaiso/tiger-go-framework/validator"
 	"golang.org/x/net/context"
 )
 
@@ -17,6 +19,20 @@ import (
 type Entity interface {
 	GetID() int64
 	SetID(int64)
+}
+
+// CreatedUpdatedSetter is capable to set created and updated timestamps on a struct
+type CreatedUpdatedEntity interface {
+	SetCreated(date time.Time)
+	SetUpdated(date time.Time)
+}
+type VersionedEntity interface {
+	SetVersion(int64)
+	GetVersion() int64
+}
+
+type LockedEntity interface {
+	IsLocked() bool
 }
 
 // Repository is a entity repository
@@ -39,21 +55,34 @@ type ContextFactory interface {
 type ContextProvider interface {
 	GetContext() context.Context
 }
-
-// CreatedUpdatedSetter is capable to set created and updated timestamps on a struct
-type CreatedUpdatedSetter interface {
-	SetCreated(date time.Time)
-	SetUpdated(date time.Time)
+type RepositoryProvider interface {
+	GetRepository() Repository
 }
-type VersionGetterSetter interface {
-	SetVersion(int64)
-	GetVersion() int64
+
+type SignalProvider interface {
+	GetSignal() signal.Signal
 }
 
 type UniqueEntityValidatorProvider interface {
-	UniqueEntityValidator(field string, values map[string]interface{}, errors validation.Error)
+	UniqueEntityValidator(field string, values map[string]interface{}, errors validator.Error)
 }
 
 type ExistingEntityValidatorProvider interface {
-	ExistingEntityValidator(field string, entityName string, values map[string]interface{}, errors validation.Error)
+	ExistingEntityValidator(field string, entityName string, values map[string]interface{}, errors validator.Error)
+}
+
+type ContextAwareContainer interface {
+	tiger.Container
+	ContextProvider
+}
+
+type EndPointContainer interface {
+	tiger.Container
+	RepositoryProvider
+	GetPrototype() reflect.Type
+	SignalProvider
+}
+
+type EndPointContainerFactory interface {
+	Create(tiger.Container) EndPointContainer
 }

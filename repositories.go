@@ -1,45 +1,75 @@
 package smartsnippets
 
 import (
+	"fmt"
 	"reflect"
+
+	"github.com/Mparaiso/tiger-go-framework/signal"
 
 	"golang.org/x/net/context"
 
 	"google.golang.org/appengine/datastore"
 )
 
+// Kind list app kinds
+var Kind = struct{ Users, Migrations, Snippets, Categories, Roles, UserRoles string }{
+	"Users", "Migrations", "Snippets", "Categories", "Roles", "UserRoles",
+}
+
 // DefaultRepository is the default implementation of Repository
 type DefaultRepository struct {
 	Context context.Context
 	Kind    string
-	Signal  Signal
+	Signal  signal.Signal
 }
 
 // NewDefaultRepository creates a new DefaultRepository
-func NewDefaultRepository(ctx context.Context, kind string, listeners ...Listener) *DefaultRepository {
+func NewDefaultRepository(ctx context.Context, kind string, listeners ...signal.Listener) *DefaultRepository {
 	defaultRepository := &DefaultRepository{Context: ctx, Kind: kind}
-	defaultRepository.Signal = NewDefaultSignal()
-	defaultRepository.Signal.Add(ListenerFunc(BeforeEntityCreateListener))
-	defaultRepository.Signal.Add(ListenerFunc(BeforeEntityUpdateListener))
+	defaultRepository.Signal = signal.NewDefaultSignal()
+	defaultRepository.Signal.Add(signal.ListenerFunc(BeforeEntityCreatedListener))
+	defaultRepository.Signal.Add(signal.ListenerFunc(BeforeEntityUpdatedListener))
 	for _, listener := range listeners {
 		defaultRepository.Signal.Add(listener)
 	}
 	return defaultRepository
 }
 
+type ContextValue int
+
+const (
+	ParentKey ContextValue = iota
+)
+
+var (
+	ErrParentKeyNotFound = fmt.Errorf("ErrParentKeyNotFound")
+)
+
+func (repository DefaultRepository) GetParentKey() (*datastore.Key, error) {
+	//	if parentKey, ok := repository.Context.Value(ParentKey).(*datastore.Key); ok {
+	//		return parentKey, nil
+	//	}
+	//	return nil, ErrParentKeyNotFound
+	return GetRootKey(repository.Context), nil
+}
+
 // Create an entity
 func (repository DefaultRepository) Create(entity Entity) error {
-	low, _, err := datastore.AllocateIDs(repository.Context, repository.Kind, nil, 1)
+	parentKey, err := repository.GetParentKey()
+	if err != nil {
+		return err
+	}
+	low, _, err := datastore.AllocateIDs(repository.Context, repository.Kind, parentKey, 1)
 	entity.SetID(low)
 
 	if err == nil {
 		if repository.Signal != nil {
-			err = repository.Signal.Dispatch(BeforeEntityCreateEvent{entity})
+			err = repository.Signal.Dispatch(BeforeEntityCreatedEvent{entity})
 			if err != nil {
 				return err
 			}
 		}
-		key := datastore.NewKey(repository.Context, repository.Kind, "", entity.GetID(), nil)
+		key := datastore.NewKey(repository.Context, repository.Kind, "", entity.GetID(), parentKey)
 		_, err = datastore.Put(repository.Context, key, entity)
 	}
 	return err
@@ -47,14 +77,18 @@ func (repository DefaultRepository) Create(entity Entity) error {
 
 // Update an entity
 func (repository DefaultRepository) Update(entity Entity) error {
-	key := datastore.NewKey(repository.Context, repository.Kind, "", entity.GetID(), nil)
+	parentKey, err := repository.GetParentKey()
+	if err != nil {
+		return err
+	}
+	key := datastore.NewKey(repository.Context, repository.Kind, "", entity.GetID(), parentKey)
 	old := reflect.New(reflect.Indirect(reflect.ValueOf(entity)).Type()).Interface()
-	err := datastore.Get(repository.Context, key, old)
+	err = datastore.Get(repository.Context, key, old)
 	if err != nil {
 		return err
 	}
 	if repository.Signal != nil {
-		err := repository.Signal.Dispatch(BeforeEntityUpdateEvent{old.(Entity), entity})
+		err := repository.Signal.Dispatch(BeforeEntityUpdatedEvent{old.(Entity), entity})
 		if err != nil {
 			return err
 		}
@@ -65,9 +99,13 @@ func (repository DefaultRepository) Update(entity Entity) error {
 
 // Delete an entity
 func (repository DefaultRepository) Delete(entity Entity) error {
-	key := datastore.NewKey(repository.Context, repository.Kind, "", entity.GetID(), nil)
+	parentKey, err := repository.GetParentKey()
+	if err != nil {
+		return err
+	}
+	key := datastore.NewKey(repository.Context, repository.Kind, "", entity.GetID(), parentKey)
 	if repository.Signal != nil {
-		err := repository.Signal.Dispatch(BeforeEntityDeleteEvent{entity})
+		err = repository.Signal.Dispatch(BeforeEntityDeletedEvent{entity})
 		if err != nil {
 			return err
 		}
@@ -77,13 +115,21 @@ func (repository DefaultRepository) Delete(entity Entity) error {
 
 // FindByID gets an entity by id
 func (repository DefaultRepository) FindByID(id int64, entity Entity) error {
-	key := datastore.NewKey(repository.Context, repository.Kind, "", id, nil)
+	parentKey, err := repository.GetParentKey()
+	if err != nil {
+		return err
+	}
+	key := datastore.NewKey(repository.Context, repository.Kind, "", id, parentKey)
 	return datastore.Get(repository.Context, key, entity)
 }
 
 // FindAll returns all entities
 func (repository DefaultRepository) FindAll(entities interface{}) error {
-	_, err := datastore.NewQuery(repository.Kind).GetAll(repository.Context, entities)
+	parentKey, err := repository.GetParentKey()
+	if err != nil {
+		return err
+	}
+	_, err = datastore.NewQuery(repository.Kind).Ancestor(parentKey).GetAll(repository.Context, entities)
 	return err
 }
 
@@ -98,14 +144,22 @@ type Query struct {
 func (repository DefaultRepository) FindBy(
 	query Query,
 	result interface{}) error {
+	parentKey, err := repository.GetParentKey()
+	if err != nil {
+		return err
+	}
 	q := repository.createQuery(query)
-	_, err := q.GetAll(repository.Context, result)
+	_, err = q.Ancestor(parentKey).GetAll(repository.Context, result)
 	return err
 }
 
 func (repository DefaultRepository) Count(
 	query Query) (int, error) {
-	return repository.createQuery(query).Count(repository.Context)
+	parentKey, err := repository.GetParentKey()
+	if err != nil {
+		return 0, err
+	}
+	return repository.createQuery(query).Ancestor(parentKey).Count(repository.Context)
 }
 
 func (repository DefaultRepository) createQuery(query Query) *datastore.Query {
@@ -128,10 +182,46 @@ func (repository DefaultRepository) createQuery(query Query) *datastore.Query {
 
 type UserRepository struct {
 	Repository
+	*RoleRepository
+	*UserRoleRepository
 }
 
 func NewUserRepository(ctx context.Context) *UserRepository {
-	return &UserRepository{NewDefaultRepository(ctx, Kind.Users)}
+
+	repository := &UserRepository{Repository: NewDefaultRepository(ctx, Kind.Users)}
+	repository.RoleRepository = NewRoleRepository(ctx)
+	repository.UserRoleRepository = NewUserRoleRepository(ctx)
+	return repository
+}
+
+func (u *UserRepository) Create(entity Entity) error {
+	if _, ok := entity.(*User); !ok {
+		return fmt.Errorf("Entity is ot of type *User")
+	}
+
+	err := u.Repository.Create(entity)
+	if err != nil {
+		return err
+	}
+	roles := []*Role{}
+	err = u.RoleRepository.FindBy(Query{Query: map[string]interface{}{"Name=": "User"}, Limit: 1}, &roles)
+	if err != nil {
+		return err
+	}
+	if len(roles) == 0 {
+		return fmt.Errorf("Role with Name User not found")
+	}
+	userRole := &UserRole{UserID: entity.GetID(), RoleID: roles[0].GetID()}
+	err = u.UserRoleRepository.Create(userRole)
+	return err
+}
+
+type RoleRepository struct {
+	Repository
+}
+
+func NewRoleRepository(ctx context.Context) *RoleRepository {
+	return &RoleRepository{NewDefaultRepository(ctx, Kind.Roles)}
 }
 
 type CategoryRepository struct {
@@ -148,4 +238,12 @@ type MigrationRepository struct {
 
 func NewMigrationRepository(ctx context.Context) *MigrationRepository {
 	return &MigrationRepository{NewDefaultRepository(ctx, Kind.Migrations)}
+}
+
+type UserRoleRepository struct {
+	Repository
+}
+
+func NewUserRoleRepository(ctx context.Context) *UserRoleRepository {
+	return &UserRoleRepository{NewDefaultRepository(ctx, Kind.UserRoles)}
 }
