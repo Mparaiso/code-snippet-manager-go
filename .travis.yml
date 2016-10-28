@@ -7,7 +7,7 @@
   ],
   "script": [
     "go version",
-    "go get -u",
+    "go get -v -t -d ./...",
     "\"$HOME/sdk/go_appengine/goapp\" test -v ./..."
   ]
 }
